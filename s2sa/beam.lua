@@ -12,6 +12,7 @@ stringx = require 'pl.stringx'
 local sent_id = 0
 local opt = {}
 local cmd = torch.CmdLine()
+local prev_dec_state = nil
 
 -- file location
 cmd:option('-model', 'seq2seq_lstm_attn.t7.', [[Path to model .t7 file]])
@@ -22,9 +23,12 @@ cmd:option('-src_dict', 'data/demo.src.dict', [[Path to source vocabulary (*.src
 cmd:option('-targ_dict', 'data/demo.targ.dict', [[Path to target vocabulary (*.targ.dict file)]])
 cmd:option('-feature_dict_prefix', 'data/demo', [[Prefix of the path to features vocabularies (*.feature_N.dict files)]])
 cmd:option('-char_dict', 'data/demo.char.dict', [[If using chars, path to character vocabulary (*.char.dict file)]])
+cmd:option('-stream', 0, [[Enable Stream Decoding]])
 
 -- beam search options
 cmd:option('-beam', 5, [[Beam size]])
+cmd:option('-keep_dec_state', 0, [[Keep Decoder state from previous life]])
+cmd:option('-policy', 'wue', [[Policy]])
 cmd:option('-max_sent_l', 250, [[Maximum sentence length. If any sequences in srcfile are longer than this then it will error out]])
 cmd:option('-simple', 0, [[If = 1, output prediction is simply the first time the top of the beam
                          ends with an end-of-sentence token. If = 0, the model considers all
@@ -45,6 +49,11 @@ cmd:option('-cudnn', 0, [[If using character model, this should be = 1 if the ch
 
 cmd:option('-rescore', '', [[use specified metric to select best translation in the beam, available: bleu, gleu]])
 cmd:option('-rescore_param', 4, [[parameter for the scoring metric, for BLEU is corresponding to n_gram ]])
+
+-- nwords policy arguments
+cmd:option('-nwords_start', 8, [[nwords policy start delay]])
+cmd:option('-nwords_read', 4, [[nwords policy read delay]])
+cmd:option('-nwords_write', 4, [[nwords policy write delay]])
 
 function copy(orig)
   local orig_type = type(orig)
@@ -115,6 +124,29 @@ function flat_to_rc(v, flat_index)
   return row, (flat_index - 1) % v:size(2) + 1
 end
 
+function typeof(var)
+    local _type = type(var);
+    if(_type ~= "table" and _type ~= "userdata") then
+        return _type;
+    end
+    local _meta = getmetatable(var);
+    if(_meta ~= nil and _meta._NAME ~= nil) then
+        return _meta._NAME;
+    else
+        return _type;
+    end
+end
+
+-- orig is any table of CudaTensors
+function deepcopy(orig)
+  new_copy = {}
+  for i = 1, #orig do
+    -- table.insert(rnn_state_dec, init_fwd_dec[i]:zero())
+    table.insert(new_copy, orig[i]:clone())
+  end
+  return new_copy
+end
+
 function generate_beam(model, initial, K, max_sent_l, source, source_features, gold)
   --reset decoder initial states
   if opt.gpuid >= 0 and opt.gpuid2 >= 0 then
@@ -152,7 +184,7 @@ function generate_beam(model, initial, K, max_sent_l, source, source_features, g
     table.insert(rnn_state_enc, init_fwd_enc[i]:zero())
   end
   local context = context_proto[{{}, {1,source_l}}]:clone() -- 1 x source_l x rnn_size
-
+  -- print("Contexts:",context:sum())
   for t = 1, source_l do
     local encoder_input = {source_input[t]}
     if model_opt.num_source_features > 0 then
@@ -162,10 +194,20 @@ function generate_beam(model, initial, K, max_sent_l, source, source_features, g
     local out = model[1]:forward(encoder_input)
     rnn_state_enc = out
     context[{{},t}]:copy(out[#out])
+    -- print("Contexts:",context:sum())
   end
+
   rnn_state_dec = {}
+
+  if prev_dec_state == nil or opt.keep_dec_state == 0 then
+    prev_dec_state = deepcopy(init_fwd_dec)
+  end
+  -- print(typeof(prev_dec_state[1]))
+  -- print(prev_dec_state[1][1][1])
+  -- print(init_fwd_dec)
   for i = 1, #init_fwd_dec do
-    table.insert(rnn_state_dec, init_fwd_dec[i]:zero())
+    -- table.insert(rnn_state_dec, init_fwd_dec[i]:zero())
+    table.insert(rnn_state_dec, prev_dec_state[i])
   end
 
   if model_opt.init_dec == 1 then
@@ -236,12 +278,18 @@ function generate_beam(model, initial, K, max_sent_l, source, source_features, g
         decoder_input1 = torch.LongTensor({decoder_input1})
       end
     end
+    -- local decsum = 0
+    -- for idx = 1,#rnn_state_dec do
+      -- decsum = decsum + rnn_state_dec[idx]:sum()
+    -- end
+    -- print("Decoder input:", decoder_input1:sum(), context:sum(), decsum)
     local decoder_input
     if model_opt.attn == 1 then
       decoder_input = {decoder_input1, context, table.unpack(rnn_state_dec)}
     else
       decoder_input = {decoder_input1, context[{{}, source_l}], table.unpack(rnn_state_dec)}
     end
+
     local out_decoder = model[2]:forward(decoder_input)
     local out = model[3]:forward(out_decoder[#out_decoder]) -- K x vocab_size
 
@@ -296,6 +344,13 @@ function generate_beam(model, initial, K, max_sent_l, source, source_features, g
         flat_out[index[1]] = -1e9
       end
     end
+
+    -- for k = 1,K do
+    --   io.write(scores[i][k],"\t")
+    -- end
+    -- io.write("\n")
+
+
     for j = 1, #rnn_state_dec do
       rnn_state_dec[j]:copy(rnn_state_dec[j]:index(1, prev_ks[i]))
     end
@@ -323,6 +378,8 @@ function generate_beam(model, initial, K, max_sent_l, source, source_features, g
       end
     end
   end
+
+  prev_dec_state = deepcopy(rnn_state_dec)
 
   local best_mscore = -1e9
   local mscore_hyp
@@ -383,6 +440,7 @@ function generate_beam(model, initial, K, max_sent_l, source, source_features, g
       gold_score = gold_score + out[1][gold[t]]
     end
   end
+  -- print(end_score, max_score)
   if opt.simple == 1 or end_score > max_score or not found_eos then
     max_hyp = end_hyp
     max_score = end_score
@@ -404,6 +462,366 @@ function generate_beam(model, initial, K, max_sent_l, source, source_features, g
   end
 
   return max_hyp, max_score, max_attn_argmax, gold_score, best_hyp, best_scores, best_attn_argmax
+end
+
+local READ = 1
+local WRITE = 2
+local DEBUG = false
+-- Given a source phrase and current output_phrase, return number
+-- of words to commit. If return value is negative, write everything
+local policy_state = 0
+function n_words_policy(source_phrase, output_phrase)
+  policy_state = policy_state + 1
+  if policy_state % opt.nwords_read == 0 then
+    return opt.nwords_write
+  else
+    return 0
+  end
+end
+
+function n_words_constant_policy(source_phrase, output_phrase)
+  policy_state = policy_state + 1
+  if policy_state == opt.nwords_start then
+    return opt.nwords_write
+  elseif policy_state > opt.nwords_start and policy_state % opt.nwords_read == 0 then
+    return opt.nwords_write
+  else
+    return 0
+  end
+end
+
+function full_source_policy(source_phrase, output_phrase)
+  return 0
+end
+
+local policy = nil
+function generate_beam_stream(model, initial, K, max_sent_l, source, source_features, gold)
+  -- Initialize policy
+  if opt.policy == 'wue' then
+    policy = full_source_policy
+  elseif opt.policy == 'nwords' then
+    policy = n_words_policy
+    policy_state = 0
+  elseif opt.policy == 'nwordsconstant' then
+    policy = n_words_constant_policy
+    policy_state = 0
+  else
+    policy = full_source_policy
+  end
+  --reset decoder initial states
+  if opt.gpuid >= 0 and opt.gpuid2 >= 0 then
+    cutorch.setDevice(opt.gpuid)
+  end
+  local n = max_sent_l
+  -- Backpointer table.
+  local prev_ks = torch.LongTensor(n, K):fill(1)
+  -- Current States.
+  local next_ys = torch.LongTensor(n, K):fill(1)
+  -- Current Scores.
+  local scores = torch.FloatTensor(n, K)
+  scores:zero()
+  local source_l = math.min(source:size(1), opt.max_sent_l)
+  local attn_argmax = {} -- store attn weights
+  attn_argmax[1] = {}
+
+  local states = {} -- store predicted word idx
+  states[1] = {}
+  for k = 1, 1 do
+    table.insert(states[1], initial)
+    table.insert(attn_argmax[1], initial)
+    next_ys[1][k] = State.next(initial)
+  end
+
+  local source_input
+  if model_opt.use_chars_enc == 1 then
+    source_input = source:view(source_l, 1, source:size(2)):contiguous()
+  else
+    source_input = source:view(source_l, 1)
+  end
+
+  local rnn_state_enc = {}
+  for i = 1, #init_fwd_enc do
+    table.insert(rnn_state_enc, init_fwd_enc[i]:zero())
+  end
+
+  local context = context_proto[{{}, {1,source_l}}]:clone() -- 1 x source_l x rnn_size
+
+  -- Initialize RNN decoder
+  rnn_state_dec = {}
+  local commited_rnn_state_dec = {}
+  for i = 1, #init_fwd_dec do
+    table.insert(commited_rnn_state_dec, init_fwd_dec[i]:zero())
+  end
+  -- if model_opt.init_dec == 1 then
+  --   for L = 1, model_opt.num_layers do
+  --     commited_rnn_state_dec[L*2-1+model_opt.input_feed]:copy(
+  --       rnn_state_enc[L*2-1]:expand(K, model_opt.rnn_size))
+  --     commited_rnn_state_dec[L*2+model_opt.input_feed]:copy(
+  --       rnn_state_enc[L*2]:expand(K, model_opt.rnn_size))
+  --   end
+  -- end
+
+  -- Main loop to READ words one by one, translate target everytime 
+  -- since last commit, and decide to commit n words
+  local source_pointer = 1
+  local target_pointer = 1
+  local fully_done = false
+
+  local max_score = -1e9
+  local stream_hyp = {}
+  table.insert(stream_hyp, START)
+  -- TODO: Handle reading end of source
+  while true and not fully_done do
+    -- READ one word
+    local encoder_input = {source_input[source_pointer]}
+    if model_opt.num_source_features > 0 then
+      append_table(encoder_input, source_features[t])
+    end
+    append_table(encoder_input, rnn_state_enc)
+    local out = model[1]:forward(encoder_input)
+    if DEBUG then print("READ", idx2word_src[source_input[source_pointer][1]]) end
+    rnn_state_enc = out
+    context[{{},source_pointer}]:copy(out[#out])
+    expanded_context = context:expand(K, source_l, model_opt.rnn_size)
+    context_view = expanded_context[{{}, {1,source_pointer}, {}}]
+    -- print("Contexts:",context:sum(),expanded_context:sum(),context_view:sum())
+
+    -- Translate since last commited
+    local current_rnn_state_decs = {}
+    if source_pointer == source_l or true then
+      
+      -- if model_opt.init_dec == 1 then
+      --   for L = 1, model_opt.num_layers do
+      --     commited_rnn_state_dec[L*2-1+model_opt.input_feed]:copy(
+      --       rnn_state_enc[L*2-1]:expand(K, model_opt.rnn_size))
+      --     commited_rnn_state_dec[L*2+model_opt.input_feed]:copy(
+      --       rnn_state_enc[L*2]:expand(K, model_opt.rnn_size))
+      --   end
+      -- end
+      rnn_state_dec = deepcopy(commited_rnn_state_dec)
+      -- print("Sum:", rnn_state_dec[1]:sum())
+      
+      out_float = torch.FloatTensor()
+      local i = target_pointer
+      -- print("Target Pointer: ", target_pointer)
+      local done = false
+      local found_eos = false
+      max_score = -1e9
+      while (not done) and (i < n) do
+        i = i+1
+        states[i] = {}
+
+        -- Clear old state from uncommited translation
+        -- scores[{{i,n},{}}]:zero()
+        -- next_ys[{{i,n},{}}]:zero()
+        -- prev_ks[{{i,n},{}}]:zero()
+
+        attn_argmax[i] = {}
+        local decoder_input1
+        if model_opt.use_chars_dec == 1 then
+          decoder_input1 = word2charidx_targ:index(1, next_ys:narrow(1,i-1,1):squeeze())
+        else
+          decoder_input1 = next_ys:narrow(1,i-1,1):squeeze()
+          if opt.beam == 1 then
+            decoder_input1 = torch.LongTensor({decoder_input1})
+          end
+        end
+        local decsum = 0
+        for idx = 1,#rnn_state_dec do
+          decsum = decsum + rnn_state_dec[idx]:sum()
+        end
+        if (DEBUG) then print("Decoder input:", decoder_input1:sum(), context_view:sum(), decsum) end
+        local decoder_input
+        if model_opt.attn == 1 then
+          decoder_input = {decoder_input1, context_view, table.unpack(rnn_state_dec)}
+        else
+          decoder_input = {decoder_input1, context_view[{{}, source_pointer}], table.unpack(rnn_state_dec)}
+        end
+        local out_decoder = model[2]:forward(decoder_input)
+        local out = model[3]:forward(out_decoder[#out_decoder]) -- K x vocab_size
+
+        rnn_state_dec = {} -- to be modified later
+        if model_opt.input_feed == 1 then
+          table.insert(rnn_state_dec, out_decoder[#out_decoder])
+        end
+        for j = 1, #out_decoder - 1 do
+          table.insert(rnn_state_dec, out_decoder[j])
+        end
+
+        out_float:resize(out:size()):copy(out)
+        for k = 1, K do
+          State.disallow(out_float:select(1, k))
+          out_float[k]:add(scores[i-1][k])
+        end
+        -- All the scores available.
+
+        local flat_out = out_float:view(-1)
+        if i == 2 then
+          flat_out = out_float[1] -- all outputs same for first batch
+        end
+
+        if model_opt.start_symbol == 1 then
+          decoder_softmax.output[{{},1}]:zero()
+          decoder_softmax.output[{{},source_l}]:zero()
+        end
+
+        for k = 1, K do
+          while true do
+            local score, index = flat_out:max(1)
+            local score = score[1]
+            local prev_k, y_i = flat_to_rc(out_float, index[1])
+            states[i][k] = State.advance(states[i-1][prev_k], y_i)
+            local diff = true
+            for k2 = 1, k-1 do
+              if State.same(states[i][k2], states[i][k]) then
+                diff = false
+              end
+            end
+
+            if i < 2 or diff then
+              if model_opt.attn == 1 then
+                max_attn, max_index = decoder_softmax.output[prev_k]:max(1)
+                attn_argmax[i][k] = State.advance(attn_argmax[i-1][prev_k],max_index[1])
+              end
+              prev_ks[i][k] = prev_k
+              next_ys[i][k] = y_i
+              scores[i][k] = score
+              flat_out[index[1]] = -1e9
+              break -- move on to next k
+            end
+            flat_out[index[1]] = -1e9
+          end
+        end
+
+        -- if (DEBUG) then
+        --   for k = 1,K do
+        --     io.write(scores[i][k],"\t")
+        --   end
+        --   io.write("\n")
+        -- end
+
+        for j = 1, #rnn_state_dec do
+          rnn_state_dec[j]:copy(rnn_state_dec[j]:index(1, prev_ks[i]))
+        end
+
+        local decsum = 0
+        for idx = 1,#rnn_state_dec do
+          decsum = decsum + rnn_state_dec[idx]:sum()
+        end
+        if (DEBUG) then print("Decoder output state:", decsum) end
+
+        -- Save RNN state decoder
+        table.insert(current_rnn_state_decs, deepcopy(rnn_state_dec))
+
+        end_hyp = states[i][1]
+        end_score = scores[i][1]
+        if model_opt.attn == 1 then
+          end_attn_argmax = attn_argmax[i][1]
+        end
+        -- print('Top Beam last word: ', end_hyp[#end_hyp])
+        if end_hyp[#end_hyp] == END then
+          done = true
+          found_eos = true
+        else
+          for k = 1, K do
+            local possible_hyp = states[i][k]
+            if possible_hyp[#possible_hyp] == END then
+              found_eos = true
+              if scores[i][k] > max_score then
+                max_hyp = possible_hyp
+                max_score = scores[i][k]
+                if model_opt.attn == 1 then
+                  max_attn_argmax = attn_argmax[i][k]
+                end
+              end
+            end
+          end
+        end
+      end
+
+      local best_mscore = -1e9
+      local mscore_hyp
+      local mscore_scores
+      local mscore_attn_argmax
+      local gold_table
+      -- if (DEBUG) then print(end_score, max_score) end
+      if opt.simple == 1 or end_score > max_score or not found_eos then
+        max_hyp = end_hyp
+        max_score = end_score
+        max_attn_argmax = end_attn_argmax
+      end
+
+      local best_hyp=states[i]
+      local best_scores=scores[i]
+      local best_attn_argmax=attn_argmax[i]
+    end
+
+    if (DEBUG) then print("Lengths",#current_rnn_state_decs, target_pointer, #max_hyp) end
+
+    -- Call Policy
+    local to_write = 0
+    local num_new_words = #max_hyp - target_pointer
+    if source_pointer == source_l then
+      to_write = num_new_words
+      fully_done = true
+    else
+      -- If we are here, it means we have NOT read all
+      -- source words yet, so we should never commit EOS
+      to_write = policy(source[source_pointer], max_hyp)
+      if to_write < 0 then
+        if max_hyp[#max_hyp] == END then
+          to_write = num_new_words - 1
+        else
+          -- This will only happen when we go into infinite generation mode
+          to_write = num_new_words
+        end
+      end
+
+      if to_write > num_new_words then
+        if max_hyp[#max_hyp] == END then
+          to_write = num_new_words - 1
+        else
+          -- This will only happen when we go into infinite generation mode
+          to_write = num_new_words
+        end
+      end
+    end
+
+    if (DEBUG) then
+      print("Number of new words: ",num_new_words)
+      print("Number of words to write: ",to_write)
+      print("Number of saved states:",#current_rnn_state_decs)
+    end
+    -- print(max_hyp)
+
+    -- Commit if required
+    if (to_write > 0) then
+      if (DEBUG) then print(to_write) end
+      -- print(max_hyp)
+      if (DEBUG) then print(unpack(max_hyp, target_pointer+1, target_pointer+to_write)) end
+      for target_idx = target_pointer+1, target_pointer+to_write do
+        table.insert(stream_hyp, max_hyp[target_idx])
+        if (DEBUG) then print("WRITE",idx2word_targ[max_hyp[target_idx]]) end
+      end
+
+      commited_rnn_state_dec = deepcopy(current_rnn_state_decs[to_write])
+      local decsum = 0
+        for idx = 1,#commited_rnn_state_dec do
+          decsum = decsum + commited_rnn_state_dec[idx]:sum()
+        end
+        if (DEBUG) then
+          print("Committing dec state:", decsum)
+          print("Committing dec index:", to_write)
+        end
+      
+      target_pointer = target_pointer + to_write
+    end
+
+    -- Increment source pointer
+    source_pointer = source_pointer + 1
+  end
+  if (DEBUG) then print(stream_hyp) end
+  return stream_hyp, max_score, max_attn_argmax, gold_score, best_hyp, best_scores, best_attn_argmax
 end
 
 function idx2key(file)
@@ -767,8 +1185,13 @@ function search(line)
     target, target_str = sent2wordidx(gold[sent_id], word2idx_targ, 1)
   end
   state = State.initial(START)
-  pred, pred_score, attn, gold_score, all_sents, all_scores, all_attn = generate_beam(model,
-    state, opt.beam, MAX_SENT_L, source, source_features, target)
+  if opt.stream == 1 then
+    pred, pred_score, attn, gold_score, all_sents, all_scores, all_attn = generate_beam_stream(model,
+      state, opt.beam, MAX_SENT_L, source, source_features, target)
+  else
+    pred, pred_score, attn, gold_score, all_sents, all_scores, all_attn = generate_beam(model,
+      state, opt.beam, MAX_SENT_L, source, source_features, target)
+  end
   pred_score_total = pred_score_total + pred_score
   pred_words_total = pred_words_total + #pred - 1
   pred_sent = wordidx2sent(pred, idx2word_targ, source_str, attn, true)
