@@ -777,7 +777,7 @@ function generate_beam_stream(model, initial, K, max_sent_l, source, source_feat
         end
       end
 
-      if to_write > num_new_words then
+      if to_write >= num_new_words then
         if max_hyp[#max_hyp] == END then
           to_write = num_new_words - 1
         else
