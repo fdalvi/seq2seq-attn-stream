@@ -568,6 +568,7 @@ function generate_beam_stream(model, initial, K, max_sent_l, source, source_feat
   local fully_done = false
 
   local max_score = -1e9
+  local best_beam = -1
   local stream_hyp = {}
   table.insert(stream_hyp, START)
   -- TODO: Handle reading end of source
@@ -730,6 +731,7 @@ function generate_beam_stream(model, initial, K, max_sent_l, source, source_feat
               if scores[i][k] > max_score then
                 max_hyp = possible_hyp
                 max_score = scores[i][k]
+                best_beam = k
                 if model_opt.attn == 1 then
                   max_attn_argmax = attn_argmax[i][k]
                 end
@@ -746,6 +748,7 @@ function generate_beam_stream(model, initial, K, max_sent_l, source, source_feat
       local gold_table
       -- if (DEBUG) then print(end_score, max_score) end
       if opt.simple == 1 or end_score > max_score or not found_eos then
+        best_beam = 1
         max_hyp = end_hyp
         max_score = end_score
         max_attn_argmax = end_attn_argmax
@@ -805,16 +808,47 @@ function generate_beam_stream(model, initial, K, max_sent_l, source, source_feat
       end
 
       commited_rnn_state_dec = deepcopy(current_rnn_state_decs[to_write])
-      local decsum = 0
-        for idx = 1,#commited_rnn_state_dec do
-          decsum = decsum + commited_rnn_state_dec[idx]:sum()
+
+      -- Collapse beams to best beam
+      local committed_pointer = target_pointer + to_write
+      print("Committing to:", committed_pointer)
+      print(next_ys[{{1,committed_pointer},{}}])
+      for l = 1,#commited_rnn_state_dec do
+        for k = 1,K do
+          commited_rnn_state_dec[l][{{k},{}}]:copy(commited_rnn_state_dec[l][{{best_beam},{}}])
+
+          prev_ks[{{committed_pointer}, {k}}]:copy(prev_ks[{{committed_pointer}, {best_beam}}])
+          next_ys[{{committed_pointer}, {k}}]:copy(next_ys[{{committed_pointer}, {best_beam}}])
+          scores[{{committed_pointer}, {k}}]:copy(scores[{{committed_pointer}, {best_beam}}])
+          -- print("Diff: ", State.same(states[committed_pointer][k], states[committed_pointer][best_beam]))
+          -- attn_argmax
+          for i = 1,#states[committed_pointer][best_beam] do
+            states[committed_pointer][k][i] = states[committed_pointer][best_beam][i]
+          end
+
+          for i = 1,#attn_argmax[committed_pointer][best_beam] do
+            attn_argmax[committed_pointer][k][i] = attn_argmax[committed_pointer][best_beam][i]
+          end
+
+          -- print("Copy success: ", State.same(states[committed_pointer][k], states[committed_pointer][best_beam]))
         end
-        if (DEBUG) then
-          print("Committing dec state:", decsum)
-          print("Committing dec index:", to_write)
-        end
+      end
+      print("Best beam:",best_beam)
+      print(next_ys[{{1,committed_pointer},{}}])
       
-      target_pointer = target_pointer + to_write
+      -- print(commited_rnn_state_dec[1][{{best_beam},{}}]:size())
+      -- print(commited_rnn_state_dec[1]:size())
+      
+      local decsum = 0
+      for idx = 1,#commited_rnn_state_dec do
+        decsum = decsum + commited_rnn_state_dec[idx]:sum()
+      end
+      if (DEBUG) then
+        print("Committing dec state:", decsum)
+        print("Committing dec index:", to_write)
+      end
+      
+      target_pointer = committed_pointer
     end
 
     -- Increment source pointer
