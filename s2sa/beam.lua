@@ -470,28 +470,59 @@ local DEBUG = false
 -- Given a source phrase and current output_phrase, return number
 -- of words to commit. If return value is negative, write everything
 local policy_state = 0
-function n_words_policy(source_phrase, output_phrase)
+function n_words_policy(source_phrase, states, attn, scores, prev_ks, next_ys, num_beams, num_committed)
   policy_state = policy_state + 1
   if policy_state % opt.nwords_read == 0 then
-    return opt.nwords_write
+    return -1, opt.nwords_write
   else
-    return 0
+    return -1, 0
   end
 end
 
-function n_words_constant_policy(source_phrase, output_phrase)
+function n_words_constant_policy(source_phrase, states, attn, scores, prev_ks, next_ys, num_beams, num_committed)
   policy_state = policy_state + 1
+
+  if not (policy_state == opt.nwords_start or (policy_state > opt.nwords_start and policy_state % opt.nwords_read == 0)) then
+    return -1,0
+  end
+
+  -- Select the best beam given our nwords_write
+  local best_beam = -1
+  local max_score = -1e9
+
+  -- print("Num State worlds:",#states)
+  -- print("Num Commited already:",num_committed)
+  -- print("Num potential commit:",num_committed+opt.nwords_write)
+  for k = 1,num_beams do
+    local num_commit = opt.nwords_write
+    local curr_hyp = nil
+    if num_committed+num_commit <= #states then
+      curr_hyp = states[num_committed+num_commit][k]
+    else
+      curr_hyp = states[#states][k]
+    end
+    if curr_hyp[#curr_hyp] == END then
+      num_commit = #curr_hyp - num_committed
+    end
+    if scores[num_committed+num_commit][k] > max_score then
+      max_score = scores[num_committed+num_commit][k]
+      best_beam = k
+    end
+  end
+  -- assert(best_beam == 1)
   if policy_state == opt.nwords_start then
-    return opt.nwords_write
+    return best_beam, opt.nwords_write
   elseif policy_state > opt.nwords_start and policy_state % opt.nwords_read == 0 then
-    return opt.nwords_write
+    return best_beam, opt.nwords_write
   else
-    return 0
+    -- We should never come here
+    assert(false)
+    return best_beam, 0
   end
 end
 
-function full_source_policy(source_phrase, output_phrase)
-  return 0
+function full_source_policy(source_phrase, states, attn, scores, prev_ks, next_ys, num_beams, num_committed)
+  return -1, 0
 end
 
 local policy = nil
@@ -770,7 +801,17 @@ function generate_beam_stream(model, initial, K, max_sent_l, source, source_feat
     else
       -- If we are here, it means we have NOT read all
       -- source words yet, so we should never commit EOS
-      to_write = policy(source[source_pointer], max_hyp)
+      -- print(source[{{1,source_pointer}}])
+      best_beam_policy, to_write = policy(source[{{1,source_pointer}}], states, attn_argmax, scores, prev_ks, next_ys, K, target_pointer)
+      if best_beam_policy ~= -1 then
+        best_beam = best_beam_policy
+        idx = target_pointer+to_write
+        if idx > #states then
+          idx = #states
+        end
+        max_hyp = states[idx][best_beam]
+      end
+
       if to_write < 0 then
         if max_hyp[#max_hyp] == END then
           to_write = num_new_words - 1
@@ -811,8 +852,8 @@ function generate_beam_stream(model, initial, K, max_sent_l, source, source_feat
 
       -- Collapse beams to best beam
       local committed_pointer = target_pointer + to_write
-      print("Committing to:", committed_pointer)
-      print(next_ys[{{1,committed_pointer},{}}])
+      -- print("Committing to:", committed_pointer)
+      -- print(next_ys[{{1,committed_pointer},{}}])
       for l = 1,#commited_rnn_state_dec do
         for k = 1,K do
           commited_rnn_state_dec[l][{{k},{}}]:copy(commited_rnn_state_dec[l][{{best_beam},{}}])
@@ -833,8 +874,8 @@ function generate_beam_stream(model, initial, K, max_sent_l, source, source_feat
           -- print("Copy success: ", State.same(states[committed_pointer][k], states[committed_pointer][best_beam]))
         end
       end
-      print("Best beam:",best_beam)
-      print(next_ys[{{1,committed_pointer},{}}])
+      -- print("Best beam:",best_beam)
+      -- print(next_ys[{{1,committed_pointer},{}}])
       
       -- print(commited_rnn_state_dec[1][{{best_beam},{}}]:size())
       -- print(commited_rnn_state_dec[1]:size())
