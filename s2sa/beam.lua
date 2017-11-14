@@ -55,6 +55,10 @@ cmd:option('-nwords_start', 8, [[nwords policy start delay]])
 cmd:option('-nwords_read', 4, [[nwords policy read delay]])
 cmd:option('-nwords_write', 4, [[nwords policy write delay]])
 
+-- agent policy arguments
+cmd:option('-agent_model', '', [[trained agent]])
+cmd:option('-agent_vocab', '', [[path to agent_vocab]])
+
 function copy(orig)
   local orig_type = type(orig)
   local copy
@@ -467,9 +471,16 @@ end
 local READ = 1
 local WRITE = 2
 local DEBUG = false
--- Given a source phrase and current output_phrase, return number
--- of words to commit. If return value is negative, write everything
+
 local policy_state = 0
+local policy = nil
+local agent_model = nil
+local agent_vocab = nil
+local agent_vocab_size = nil
+
+-- Given a source phrase and current output_phrase, 
+-- return best beam and number of words to commit. 
+-- If return value is negative, write everything
 function n_words_policy(source_phrase, states, attn, scores, prev_ks, next_ys, num_beams, num_committed)
   policy_state = policy_state + 1
   if policy_state % opt.nwords_read == 0 then
@@ -521,11 +532,59 @@ function n_words_constant_policy(source_phrase, states, attn, scores, prev_ks, n
   end
 end
 
+function toOneHot_nobatch(x, num_feats)
+  x_onehot = torch.CudaTensor(agent_vocab_size * num_feats):zero()
+  for idx = 1, num_feats do
+    x_onehot[(idx-1) * agent_vocab_size + x[idx]] = 1
+  end
+  return x_onehot
+end
+
+function agent_policy(source_phrase, states, attn, scores, prev_ks, next_ys, num_beams, num_committed)
+  local num_context_words = math.min(5, source_phrase:size(1))
+  local agent_input = torch.CudaTensor(5)
+
+  for i=1,(5-num_context_words) do
+    agent_input[i] = agent_vocab['<S>']
+  end
+  local start_idx = source_phrase:size(1) - num_context_words + 1
+  for i=start_idx,source_phrase:size(1) do
+    local inp_idx = i - start_idx + 5-num_context_words + 1
+    if agent_vocab[idx2word_src[source_phrase[i]]] ~= nil then
+      agent_input[inp_idx] = agent_vocab[idx2word_src[source_phrase[i]]]
+    else
+      agent_input[inp_idx] = agent_vocab['<unk>']
+    end
+  end
+  -- print(agent_model)
+  local agent_pred = agent_model:forward(toOneHot_nobatch(agent_input, 5))
+  local _, pred_class = torch.max(agent_pred, 1)
+  pred_class = pred_class[1]
+  -- print(agent_pred, pred_class)
+  -- if pred_class == 1 then
+  --   print("Segment")
+  -- else
+  --   print("Don't segment")
+  -- end
+
+  -- print("Num source not commited:",policy_state + 1)
+  if (policy_state + 1) > 2 and pred_class == 1 then
+    local to_write = policy_state + 1 - 2
+    policy_state = policy_state + 1 - 2
+    return -1, to_write
+  else
+    policy_state = policy_state + 1
+    return -1, 0
+  end
+  -- print(agent_pred)
+  
+end
+
 function full_source_policy(source_phrase, states, attn, scores, prev_ks, next_ys, num_beams, num_committed)
   return -1, 0
 end
 
-local policy = nil
+
 function generate_beam_stream(model, initial, K, max_sent_l, source, source_features, gold)
   -- Initialize policy
   if opt.policy == 'wue' then
@@ -535,6 +594,9 @@ function generate_beam_stream(model, initial, K, max_sent_l, source, source_feat
     policy_state = 0
   elseif opt.policy == 'nwordsconstant' then
     policy = n_words_constant_policy
+    policy_state = 0
+  elseif opt.policy == 'agent' then
+    policy = agent_policy
     policy_state = 0
   else
     policy = full_source_policy
@@ -831,7 +893,7 @@ function generate_beam_stream(model, initial, K, max_sent_l, source, source_feat
       end
     end
 
-    if (DEBUG) then
+    if (DEBUG or false) then
       print("Number of new words: ",num_new_words)
       print("Number of words to write: ",to_write)
       print("Number of saved states:",#current_rnn_state_decs)
@@ -1127,6 +1189,26 @@ function init(arg)
     if not scorers[opt.rescore] then
       error("metric "..opt.rescore.." not defined")
     end
+  end
+
+  if opt.policy == 'agent' then
+    -- Load agent model/vocab if we are in first run
+    assert(path.exists(opt.agent_model), 'agent model does not exist')
+    assert(path.exists(opt.agent_vocab), 'agent vocab does not exist')
+
+    print("Loading agent dictionary...")
+    local vocab = io.open(opt.agent_vocab)
+    agent_vocab_size = 0
+    agent_vocab = {}
+    for line in vocab:lines() do
+      space_idx = line:find(" ")
+      w, w_idx = line:sub(0, space_idx-1), line:sub(space_idx+1)
+      agent_vocab[w] = w_idx
+      agent_vocab_size = agent_vocab_size + 1
+    end
+
+    print("Loading agent model...")
+    agent_model = torch.load(opt.agent_model)
   end
 
   -- load model and word2idx/idx2word dictionaries
