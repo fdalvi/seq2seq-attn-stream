@@ -540,7 +540,26 @@ function toOneHot_nobatch(x, num_feats)
   return x_onehot
 end
 
+-- Agent policy
+--   policy_state here maintains how many words have been read since
+--   the last write. We want to keep an uncommitted context of atleast
+--   two source words (hence we should never write if policy_state < 2)
+local IS_START = 1
+local start_words_so_far = 0
 function agent_policy(source_phrase, states, attn, scores, prev_ks, next_ys, num_beams, num_committed)
+  MIN_CONTEXT = 2
+
+  if (IS_START == 1) then
+    start_words_so_far = start_words_so_far + 1
+
+    if start_words_so_far == 5 then
+      IS_START = 0
+      -- print("NO MORE START!!!!!")
+    end
+    return -1, 0
+  end
+
+  -- build agent input
   local num_context_words = math.min(5, source_phrase:size(1))
   local agent_input = torch.CudaTensor(5)
 
@@ -556,34 +575,58 @@ function agent_policy(source_phrase, states, attn, scores, prev_ks, next_ys, num
       agent_input[inp_idx] = agent_vocab['<unk>']
     end
   end
-  -- print(agent_model)
+  
+  -- run agent
   local agent_pred = agent_model:forward(toOneHot_nobatch(agent_input, 5))
   local _, pred_class = torch.max(agent_pred, 1)
   pred_class = pred_class[1]
-  -- print(agent_pred, pred_class)
-  -- if pred_class == 1 then
-  --   print("Segment")
-  -- else
-  --   print("Don't segment")
-  -- end
 
-  -- print("Num source not commited:",policy_state + 1)
-  if (policy_state + 1) > 2 and pred_class == 1 then
-    local to_write = policy_state + 1 - 2
-    policy_state = policy_state + 1 - 2
-    return -1, to_write
+  local potential_policy_state = policy_state + 1 -- since we have read one more word
+
+  if (DEBUG) then
+    print("Old Policy State: ", policy_state)
+    print("Potential Policy State: ", potential_policy_state)
+    print("Potential Writes: ", potential_policy_state - MIN_CONTEXT)
+    print("Agent says: ", pred_class == 1 and "Segment" or "Don't Segment")
+  end
+
+  if potential_policy_state > MIN_CONTEXT and pred_class == 1 then
+    local to_write = potential_policy_state - MIN_CONTEXT
+    policy_state = MIN_CONTEXT
+
+  --   return -1, to_write
+  -- else
+    -- Select the best beam given our nwords_write
+    local best_beam = -1
+    local max_score = -1e9
+
+    for k = 1,num_beams do
+      local num_commit = to_write
+      local curr_hyp = nil
+      if num_committed+num_commit <= #states then
+        curr_hyp = states[num_committed+num_commit][k]
+      else
+        curr_hyp = states[#states][k]
+      end
+      if curr_hyp[#curr_hyp] == END then
+        num_commit = #curr_hyp - num_committed
+      end
+      if scores[num_committed+num_commit][k] > max_score then
+        max_score = scores[num_committed+num_commit][k]
+        best_beam = k
+      end
+    end
+    
+    return best_beam, to_write
   else
-    policy_state = policy_state + 1
+    policy_state = potential_policy_state
     return -1, 0
   end
-  -- print(agent_pred)
-  
 end
 
 function full_source_policy(source_phrase, states, attn, scores, prev_ks, next_ys, num_beams, num_committed)
   return -1, 0
 end
-
 
 function generate_beam_stream(model, initial, K, max_sent_l, source, source_features, gold)
   -- Initialize policy
@@ -598,6 +641,8 @@ function generate_beam_stream(model, initial, K, max_sent_l, source, source_feat
   elseif opt.policy == 'agent' then
     policy = agent_policy
     policy_state = 0
+    IS_START = 1
+    start_words_so_far = 0
   else
     policy = full_source_policy
   end
@@ -673,7 +718,7 @@ function generate_beam_stream(model, initial, K, max_sent_l, source, source_feat
     end
     append_table(encoder_input, rnn_state_enc)
     local out = model[1]:forward(encoder_input)
-    if DEBUG then print("READ", idx2word_src[source_input[source_pointer][1]]) end
+    if (DEBUG) then print("READ", idx2word_src[source_input[source_pointer][1]]) end
     rnn_state_enc = out
     context[{{},source_pointer}]:copy(out[#out])
     expanded_context = context:expand(K, source_l, model_opt.rnn_size)
@@ -893,7 +938,7 @@ function generate_beam_stream(model, initial, K, max_sent_l, source, source_feat
       end
     end
 
-    if (DEBUG or false) then
+    if (DEBUG) then
       print("Number of new words: ",num_new_words)
       print("Number of words to write: ",to_write)
       print("Number of saved states:",#current_rnn_state_decs)
