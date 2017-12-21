@@ -493,7 +493,16 @@ end
 function n_words_constant_policy(source_phrase, states, attn, scores, prev_ks, next_ys, num_beams, num_committed)
   policy_state = policy_state + 1
 
-  if not (policy_state == opt.nwords_start or (policy_state > opt.nwords_start and policy_state % opt.nwords_read == 0)) then
+  -- If we have not reached nwords_start yet
+  -- OR we have reached nwords_start but have not read
+  --   enough words yet
+  if not (
+    policy_state == opt.nwords_start 
+    or (
+      policy_state > opt.nwords_start 
+      and (policy_state-opt.nwords_start) % opt.nwords_read == 0
+    )
+  ) then
     return -1,0
   end
 
@@ -501,29 +510,37 @@ function n_words_constant_policy(source_phrase, states, attn, scores, prev_ks, n
   local best_beam = -1
   local max_score = -1e9
 
-  -- print("Num State worlds:",#states)
-  -- print("Num Commited already:",num_committed)
-  -- print("Num potential commit:",num_committed+opt.nwords_write)
   for k = 1,num_beams do
     local num_commit = opt.nwords_write
     local curr_hyp = nil
+
     if num_committed+num_commit <= #states then
       curr_hyp = states[num_committed+num_commit][k]
     else
+      -- This is the case where we are trying to write
+      -- more than we predicted
       curr_hyp = states[#states][k]
     end
+
+    -- If the last predicted word is EOS, we may have
+    -- less than nwords_write words to write
     if curr_hyp[#curr_hyp] == END then
       num_commit = #curr_hyp - num_committed
     end
+    assert(num_commit >= 0)
+
     if scores[num_committed+num_commit][k] > max_score then
       max_score = scores[num_committed+num_commit][k]
       best_beam = k
     end
   end
-  -- assert(best_beam == 1)
+
+  -- Here we can return num_commit (which is a better estimation
+  -- since nwords_write may overflow, but we do this check in the 
+  -- main function anyways, so we just return nwords_write)
   if policy_state == opt.nwords_start then
     return best_beam, opt.nwords_write
-  elseif policy_state > opt.nwords_start and policy_state % opt.nwords_read == 0 then
+  elseif policy_state > opt.nwords_start and (policy_state-opt.nwords_start) % opt.nwords_read == 0 then
     return best_beam, opt.nwords_write
   else
     -- We should never come here
@@ -646,22 +663,31 @@ function generate_beam_stream(model, initial, K, max_sent_l, source, source_feat
   else
     policy = full_source_policy
   end
-  --reset decoder initial states
+
+  -- Reset decoder initial states
   if opt.gpuid >= 0 and opt.gpuid2 >= 0 then
     cutorch.setDevice(opt.gpuid)
   end
   local n = max_sent_l
-  -- Backpointer table.
+  -- Backpointer table. Stores which beam paths were used
   local prev_ks = torch.LongTensor(n, K):fill(1)
-  -- Current States.
+  -- Current States. Stores which words were selected at each timestep
+  -- for each beam
   local next_ys = torch.LongTensor(n, K):fill(1)
-  -- Current Scores.
+  -- Current Scores. Stores the scores for the selected word
+  -- at each timestep for each beam
   local scores = torch.FloatTensor(n, K)
   scores:zero()
+
+  -- Cap source length to max_sent_l
   local source_l = math.min(source:size(1), opt.max_sent_l)
+
+  -- Initialize Attention structures
   local attn_argmax = {} -- store attn weights
   attn_argmax[1] = {}
 
+  -- states is somewhat redundant structure which globally
+  -- stores computation so far
   local states = {} -- store predicted word idx
   states[1] = {}
   for k = 1, 1 do
@@ -670,6 +696,8 @@ function generate_beam_stream(model, initial, K, max_sent_l, source, source_feat
     next_ys[1][k] = State.next(initial)
   end
 
+  -- Get appropriate view over source (for use_chars_enc == 0, just chaning
+  -- from 1D to 2D tensor)
   local source_input
   if model_opt.use_chars_enc == 1 then
     source_input = source:view(source_l, 1, source:size(2)):contiguous()
@@ -677,12 +705,21 @@ function generate_beam_stream(model, initial, K, max_sent_l, source, source_feat
     source_input = source:view(source_l, 1)
   end
 
+  -- Initialize encoder states (in normal conditions, 
+  -- #rnn_state_enc = 4, 2 per LSTM layer, cell and hidden)
   local rnn_state_enc = {}
   for i = 1, #init_fwd_enc do
     table.insert(rnn_state_enc, init_fwd_enc[i]:zero())
   end
 
-  local context = context_proto[{{}, {1,source_l}}]:clone() -- 1 x source_l x rnn_size
+  -- Create local context from an already allocated space
+  -- for efficiency
+  -- 1 x source_l x rnn_size
+  local context = context_proto[{{}, {1,source_l}}]:clone()
+
+  -- context will always be in the following state
+  -- [ intialized state1, intialized state2, ... intialized stateN, uninitialized states ...]
+  -- Here "N" is the number of words READ so far
 
   -- Initialize RNN decoder
   rnn_state_dec = {}
@@ -690,6 +727,9 @@ function generate_beam_stream(model, initial, K, max_sent_l, source, source_feat
   for i = 1, #init_fwd_dec do
     table.insert(commited_rnn_state_dec, init_fwd_dec[i]:zero())
   end
+
+  -- We cannot init_dec properly yet, so following is incorrect
+  -- implementation
   -- if model_opt.init_dec == 1 then
   --   for L = 1, model_opt.num_layers do
   --     commited_rnn_state_dec[L*2-1+model_opt.input_feed]:copy(
@@ -701,225 +741,354 @@ function generate_beam_stream(model, initial, K, max_sent_l, source, source_feat
 
   -- Main loop to READ words one by one, translate target everytime 
   -- since last commit, and decide to commit n words
-  local source_pointer = 1
-  local target_pointer = 1
-  local fully_done = false
+  local source_pointer = 1 -- Always points to the word that is to be read
+  local target_pointer = 1 -- Always points to the last "committed" space in target
+  local fully_done = false -- boolean to signify if we are done
 
+  -- Local variables for beam
   local max_score = -1e9
   local best_beam = -1
+
+  -- Final stream hypothesis
   local stream_hyp = {}
   table.insert(stream_hyp, START)
+  -- target_pointer is 1 since we have already committed START_OF_SENT
+
   -- TODO: Handle reading end of source
   while true and not fully_done do
     -- READ one word
+    -- encoder_input has three things:
+    -- current word, source_feats (if any), prev rnn_state
     local encoder_input = {source_input[source_pointer]}
+
+    -- Handle multiple input featues
     if model_opt.num_source_features > 0 then
       append_table(encoder_input, source_features[t])
     end
     append_table(encoder_input, rnn_state_enc)
+
+    -- Do a forward pass for the encoder
     local out = model[1]:forward(encoder_input)
+
+    -- Debug print to print which word we just ready
     if (DEBUG) then print("READ", idx2word_src[source_input[source_pointer][1]]) end
+
+    -- Reset rnn_state_enc with new computed state
     rnn_state_enc = out
+
+    -- Add newly computed encoder state to context
     context[{{},source_pointer}]:copy(out[#out])
+
+    -- "Clone context" K times for each of the K beams
     expanded_context = context:expand(K, source_l, model_opt.rnn_size)
+
+    -- Get view of only initialized context states
+    -- i.e. attention should ONLY see context from words read so far
     context_view = expanded_context[{{}, {1,source_pointer}, {}}]
-    -- print("Contexts:",context:sum(),expanded_context:sum(),context_view:sum())
 
     -- Translate since last commited
     local current_rnn_state_decs = {}
-    if source_pointer == source_l or true then
-      
-      -- if model_opt.init_dec == 1 then
-      --   for L = 1, model_opt.num_layers do
-      --     commited_rnn_state_dec[L*2-1+model_opt.input_feed]:copy(
-      --       rnn_state_enc[L*2-1]:expand(K, model_opt.rnn_size))
-      --     commited_rnn_state_dec[L*2+model_opt.input_feed]:copy(
-      --       rnn_state_enc[L*2]:expand(K, model_opt.rnn_size))
-      --   end
-      -- end
-      rnn_state_dec = deepcopy(commited_rnn_state_dec)
-      -- print("Sum:", rnn_state_dec[1]:sum())
-      
-      out_float = torch.FloatTensor()
-      local i = target_pointer
-      -- print("Target Pointer: ", target_pointer)
-      local done = false
-      local found_eos = false
-      max_score = -1e9
-      while (not done) and (i < n) do
-        i = i+1
-        states[i] = {}
 
-        -- Clear old state from uncommited translation
-        -- scores[{{i,n},{}}]:zero()
-        -- next_ys[{{i,n},{}}]:zero()
-        -- prev_ks[{{i,n},{}}]:zero()
+    -- if model_opt.init_dec == 1 then
+    --   for L = 1, model_opt.num_layers do
+    --     commited_rnn_state_dec[L*2-1+model_opt.input_feed]:copy(
+    --       rnn_state_enc[L*2-1]:expand(K, model_opt.rnn_size))
+    --     commited_rnn_state_dec[L*2+model_opt.input_feed]:copy(
+    --       rnn_state_enc[L*2]:expand(K, model_opt.rnn_size))
+    --   end
+    -- end
 
-        attn_argmax[i] = {}
-        local decoder_input1
-        if model_opt.use_chars_dec == 1 then
-          decoder_input1 = word2charidx_targ:index(1, next_ys:narrow(1,i-1,1):squeeze())
-        else
-          decoder_input1 = next_ys:narrow(1,i-1,1):squeeze()
-          if opt.beam == 1 then
-            decoder_input1 = torch.LongTensor({decoder_input1})
-          end
+    -- Restore Decoder hidden state to committed state
+    -- By doing this, we are essentially "going back in time"
+    -- to the moment we predicted the last committed word
+    rnn_state_dec = deepcopy(commited_rnn_state_dec)
+    
+    out_float = torch.FloatTensor()
+    local i = target_pointer
+    local done = false
+    local found_eos = false
+
+    -- n here is max_sent_length
+    -- We keep producing words until we are "done" or we have
+    -- hit the max number of words we can produce
+    max_score = -1e9
+    while (not done) and (i < n) do
+      -- i+1 points to the first "empty" space in the target sequence
+      i = i+1
+
+      -- Clear ith state (i+1, i+2, i+3 have some garbage from
+      -- previous run, but we don't need to explicitly clear it
+      -- for efficiency)
+      states[i] = {}
+
+      -- Clear old state from uncommitted translation
+      -- We dont do this explicitly for efficiency
+      -- scores[{{i,n},{}}]:zero()
+      -- next_ys[{{i,n},{}}]:zero()
+      -- prev_ks[{{i,n},{}}]:zero()
+
+      -- Clear ith attention state
+      attn_argmax[i] = {}
+
+      -- Build decoder input
+      local decoder_input1
+      if model_opt.use_chars_dec == 1 then
+        decoder_input1 = word2charidx_targ:index(1, next_ys:narrow(1,i-1,1):squeeze())
+      else
+        decoder_input1 = next_ys:narrow(1,i-1,1):squeeze()
+        if opt.beam == 1 then
+          decoder_input1 = torch.LongTensor({decoder_input1})
         end
+      end
+      -- decoder_input1 is previously predicted word(s) per beam
+
+      if (DEBUG) then 
         local decsum = 0
         for idx = 1,#rnn_state_dec do
           decsum = decsum + rnn_state_dec[idx]:sum()
         end
-        if (DEBUG) then print("Decoder input:", decoder_input1:sum(), context_view:sum(), decsum) end
-        local decoder_input
-        if model_opt.attn == 1 then
-          decoder_input = {decoder_input1, context_view, table.unpack(rnn_state_dec)}
-        else
-          decoder_input = {decoder_input1, context_view[{{}, source_pointer}], table.unpack(rnn_state_dec)}
-        end
-        local out_decoder = model[2]:forward(decoder_input)
-        local out = model[3]:forward(out_decoder[#out_decoder]) -- K x vocab_size
+        print("Decoder input:", decoder_input1:sum(), context_view:sum(), decsum)
+      end
 
-        rnn_state_dec = {} -- to be modified later
-        if model_opt.input_feed == 1 then
-          table.insert(rnn_state_dec, out_decoder[#out_decoder])
-        end
-        for j = 1, #out_decoder - 1 do
-          table.insert(rnn_state_dec, out_decoder[j])
-        end
+      -- Build rest of the decoder input:
+      -- previous words, attention input, previous decoder states
+      -- Remember, decoder includes attention mechanism
+      local decoder_input
+      if model_opt.attn == 1 then
+        decoder_input = {decoder_input1, context_view, table.unpack(rnn_state_dec)}
+      else
+        decoder_input = {decoder_input1, context_view[{{}, source_pointer}], table.unpack(rnn_state_dec)}
+      end
 
-        out_float:resize(out:size()):copy(out)
-        for k = 1, K do
-          State.disallow(out_float:select(1, k))
-          out_float[k]:add(scores[i-1][k])
-        end
-        -- All the scores available.
+      -- Forward pass on the attention mechanism and decoder
+      local out_decoder = model[2]:forward(decoder_input)
 
-        local flat_out = out_float:view(-1)
-        if i == 2 then
-          flat_out = out_float[1] -- all outputs same for first batch
-        end
+      -- model[3] is the generator model
+      local out = model[3]:forward(out_decoder[#out_decoder])
+      -- out is scores per beam [K x vocab_size]
 
-        if model_opt.start_symbol == 1 then
-          decoder_softmax.output[{{},1}]:zero()
-          decoder_softmax.output[{{},source_l}]:zero()
-        end
+      -- Get new RNN Decoder state
+      rnn_state_dec = {} -- to be modified later
+      if model_opt.input_feed == 1 then
+        table.insert(rnn_state_dec, out_decoder[#out_decoder])
+      end
+      for j = 1, #out_decoder - 1 do
+        table.insert(rnn_state_dec, out_decoder[j])
+      end
 
-        for k = 1, K do
-          while true do
-            local score, index = flat_out:max(1)
-            local score = score[1]
-            local prev_k, y_i = flat_to_rc(out_float, index[1])
-            states[i][k] = State.advance(states[i-1][prev_k], y_i)
-            local diff = true
-            for k2 = 1, k-1 do
-              if State.same(states[i][k2], states[i][k]) then
-                diff = false
-              end
+      -- Convert scores to float tensor explicitly
+      out_float:resize(out:size()):copy(out)
+      -- out_float is also of size K x vocab_size
+      for k = 1, K do
+        -- Explicitly not allow "PAD" and "START_OF_SENT" to be 
+        -- max scores
+        -- Add scores from previous hypothesis (adding in logspace)
+        State.disallow(out_float:select(1, k))
+        out_float[k]:add(scores[i-1][k])
+      end
+
+      -- All the scores are now available.
+
+      local flat_out = out_float:view(-1)
+      
+      -- If we have not predicted anything so far (only START OF SENT)
+      -- all beams will have EXACTLY the same scores - so consider only
+      -- the first beam (only when i=2)!
+      if i == 2 then
+        flat_out = out_float[1] -- all outputs same for first batch
+      end
+
+      -- Only if you use special start symbol, we don't usually do
+      -- this
+      if model_opt.start_symbol == 1 then
+        decoder_softmax.output[{{},1}]:zero()
+        decoder_softmax.output[{{},source_l}]:zero()
+      end
+
+      -- For each beam, select the next "best" choice for current timestep
+      --            +------------> ----+------>
+      --            |                  |
+      --            +------------> -+  +------>
+      --            |               |
+      -- +----------------------->  +--------->
+      --            |
+      --            +------------> ----------->
+      --            |
+      --            +------------> ----------->
+      -- 
+      --    t=0          t=1            t=2
+      -- In general, for any beam k, previous decoding path can be
+      -- from any other beam
+      -- In the above example, at t=2, we discard beam 3 completely,
+      -- and use beam 1 twice
+      for k = 1, K do
+        while true do
+          -- Select the maximum scores from scores of ALL prev beams
+          -- Q: Are scores across beams comparable? Does score of 
+          --     0.89 in beam 1 == score of 0.89 in beam 2?
+          -- Potential A: Yes, since they are still over same vocab
+          -- This assumption has been made here.
+          local score, index = flat_out:max(1)
+          local score = score[1]
+
+          -- prev_k = beam that predicted max scoring word
+          -- y_i = max scoring word index within beam
+          local prev_k, y_i = flat_to_rc(out_float, index[1])
+          states[i][k] = State.advance(states[i-1][prev_k], y_i)
+
+          -- Check if the newly selected word causes the current
+          -- beam to be equal to any other beam. If it is the same
+          -- we dont want to select the current word, since we want
+          -- the beams to be different.
+          local diff = true
+          for k2 = 1, k-1 do
+            if State.same(states[i][k2], states[i][k]) then
+              diff = false
             end
+          end
 
-            if i < 2 or diff then
-              if model_opt.attn == 1 then
-                max_attn, max_index = decoder_softmax.output[prev_k]:max(1)
-                attn_argmax[i][k] = State.advance(attn_argmax[i-1][prev_k],max_index[1])
-              end
-              prev_ks[i][k] = prev_k
-              next_ys[i][k] = y_i
-              scores[i][k] = score
-              flat_out[index[1]] = -1e9
-              break -- move on to next k
+          -- If the newly selected word DOES NOT cause the current
+          -- beam to be the same as any other beam (or we are at the
+          -- first target word, go ahead and mark this beam as done)
+          if i < 2 or diff then
+            if model_opt.attn == 1 then
+              max_attn, max_index = decoder_softmax.output[prev_k]:max(1)
+              attn_argmax[i][k] = State.advance(attn_argmax[i-1][prev_k],max_index[1])
             end
+            prev_ks[i][k] = prev_k
+            next_ys[i][k] = y_i
+            scores[i][k] = score
             flat_out[index[1]] = -1e9
+            break -- move on to next k
           end
+
+          -- We come here if we have not finalized this beam, i.e.
+          -- it was the same as some other beam. This failure happened
+          -- because of currently selected max_word, so lets set its
+          -- score to a very small value.
+          flat_out[index[1]] = -1e9
         end
+      end
 
-        -- if (DEBUG) then
-        --   for k = 1,K do
-        --     io.write(scores[i][k],"\t")
-        --   end
-        --   io.write("\n")
-        -- end
+      -- New RNN states will depend on which beams we are "moving forward"
+      -- with - e.g. in the above example we will discard RNN states for
+      -- beam 3 (and RNN state for beam 1 will be replicated twice)
+      for j = 1, #rnn_state_dec do
+        rnn_state_dec[j]:copy(rnn_state_dec[j]:index(1, prev_ks[i]))
+      end
 
-        for j = 1, #rnn_state_dec do
-          rnn_state_dec[j]:copy(rnn_state_dec[j]:index(1, prev_ks[i]))
-        end
-
+      if (DEBUG) then
         local decsum = 0
         for idx = 1,#rnn_state_dec do
           decsum = decsum + rnn_state_dec[idx]:sum()
         end
-        if (DEBUG) then print("Decoder output state:", decsum) end
+        print("Decoder output state:", decsum)
+      end
 
-        -- Save RNN state decoder
-        table.insert(current_rnn_state_decs, deepcopy(rnn_state_dec))
+      -- Save RNN state decoder
+      table.insert(current_rnn_state_decs, deepcopy(rnn_state_dec))
 
-        end_hyp = states[i][1]
-        end_score = scores[i][1]
-        if model_opt.attn == 1 then
-          end_attn_argmax = attn_argmax[i][1]
-        end
-        -- print('Top Beam last word: ', end_hyp[#end_hyp])
-        if end_hyp[#end_hyp] == END then
-          done = true
-          found_eos = true
-        else
-          for k = 1, K do
-            local possible_hyp = states[i][k]
-            if possible_hyp[#possible_hyp] == END then
-              found_eos = true
-              if scores[i][k] > max_score then
-                max_hyp = possible_hyp
-                max_score = scores[i][k]
-                best_beam = k
-                if model_opt.attn == 1 then
-                  max_attn_argmax = attn_argmax[i][k]
-                end
+      -- Beam 1 will ALWAYS be the best beam, lets assume its
+      -- our final answer
+      end_hyp = states[i][1]
+      end_score = scores[i][1]
+      if model_opt.attn == 1 then
+        end_attn_argmax = attn_argmax[i][1]
+      end
+      
+      -- If Beam 1 actually ends i.e. has EOS symbol, our assumption
+      -- is correct and we finish decoding
+      if end_hyp[#end_hyp] == END then
+        done = true
+        found_eos = true
+      else
+        -- If Beam 1 does not have an EOS symbol, its possible that
+        --   some other beam does have and EOS symbol.
+        -- We will consider all beams with EOS symbol, and pick the
+        --   one with max_score
+        -- BUT we still continue decoding in the hope that Beam 1
+        --   will produce EOS at some point. If that never happens
+        --   max_{hyp,score} will come into account
+        for k = 1, K do
+          local possible_hyp = states[i][k]
+          if possible_hyp[#possible_hyp] == END then
+            found_eos = true
+            if scores[i][k] > max_score then
+              max_hyp = possible_hyp
+              max_score = scores[i][k]
+              best_beam = k
+              if model_opt.attn == 1 then
+                max_attn_argmax = attn_argmax[i][k]
               end
             end
           end
         end
       end
-
-      local best_mscore = -1e9
-      local mscore_hyp
-      local mscore_scores
-      local mscore_attn_argmax
-      local gold_table
-      -- if (DEBUG) then print(end_score, max_score) end
-      if opt.simple == 1 or end_score > max_score or not found_eos then
-        best_beam = 1
-        max_hyp = end_hyp
-        max_score = end_score
-        max_attn_argmax = end_attn_argmax
-      end
-
-      local best_hyp=states[i]
-      local best_scores=scores[i]
-      local best_attn_argmax=attn_argmax[i]
     end
 
+    -- Here, we have the following variables now:
+    -- end_{hyp,score,attn_argmax} == Beam 1
+    -- max_{hyp,score,attn_argmax} == undefined if Beam 1 had EOS
+    --                             == some BEAM if Beam 1 never had EOS
+
+    local best_mscore = -1e9
+    local mscore_hyp
+    local mscore_scores
+    local mscore_attn_argmax
+    local gold_table
+    
+    -- opt.simple is usually 0
+    -- If EOS was found (by any beam) AND that beam had a good score,
+    -- we keep that beam (good score means more than Beam 1)
+    -- If EOS was not found at all, Beam 1 is our best shot, so set
+    -- max_{*} = end_{*}
+    if opt.simple == 1 or end_score > max_score or not found_eos then
+      best_beam = 1
+      max_hyp = end_hyp
+      max_score = end_score
+      max_attn_argmax = end_attn_argmax
+    end
+
+    local best_hyp=states[i]
+    local best_scores=scores[i]
+    local best_attn_argmax=attn_argmax[i]
+
     if (DEBUG) then print("Lengths",#current_rnn_state_decs, target_pointer, #max_hyp) end
+
+    -- max_{*} now has the best hypothesis (could be any beam)
 
     -- Call Policy
     local to_write = 0
     local num_new_words = #max_hyp - target_pointer
+
+    -- If we have READ all words in the source sentence, to_write is all words
     if source_pointer == source_l then
       to_write = num_new_words
       fully_done = true
     else
       -- If we are here, it means we have NOT read all
       -- source words yet, so we should never commit EOS
-      -- print(source[{{1,source_pointer}}])
       best_beam_policy, to_write = policy(source[{{1,source_pointer}}], states, attn_argmax, scores, prev_ks, next_ys, K, target_pointer)
+
+      -- policy will return best_beam and how many words it thinks we should
+      -- write
+      -- best_beam can be -1, in which consider it to be max_hyp
+      -- If it is not, lets change max_hyp to one that beam says
       if best_beam_policy ~= -1 then
         best_beam = best_beam_policy
         idx = target_pointer+to_write
         if idx > #states then
+          -- This happens when the policy is dumb, i.e. it doesn't
+          -- check if to_write number of writes is even possible
           idx = #states
         end
         max_hyp = states[idx][best_beam]
+        -- TODO: max_score and max_attn_argmax should be set!
       end
 
+      -- If to_write < 0, it means write everything
       if to_write < 0 then
+        -- If the last state is EOS, we do not write the EOS
         if max_hyp[#max_hyp] == END then
           to_write = num_new_words - 1
         else
@@ -928,6 +1097,8 @@ function generate_beam_stream(model, initial, K, max_sent_l, source, source_feat
         end
       end
 
+      -- This will happen when the policy is dumb, i.e. it doesn't
+      -- check if to_write number of writes is even possible
       if to_write >= num_new_words then
         if max_hyp[#max_hyp] == END then
           to_write = num_new_words - 1
@@ -943,59 +1114,58 @@ function generate_beam_stream(model, initial, K, max_sent_l, source, source_feat
       print("Number of words to write: ",to_write)
       print("Number of saved states:",#current_rnn_state_decs)
     end
-    -- print(max_hyp)
 
     -- Commit if required
     if (to_write > 0) then
       if (DEBUG) then print(to_write) end
-      -- print(max_hyp)
       if (DEBUG) then print(unpack(max_hyp, target_pointer+1, target_pointer+to_write)) end
-      for target_idx = target_pointer+1, target_pointer+to_write do
+
+      -- Write to_write words from target_pointer+1
+      local committed_pointer = target_pointer + to_write
+
+      for target_idx = target_pointer+1, committed_pointer do
         table.insert(stream_hyp, max_hyp[target_idx])
         if (DEBUG) then print("WRITE",idx2word_targ[max_hyp[target_idx]]) end
       end
 
+      -- Consider the to_write'th time step for the next "committed" RNN
+      -- decoder state
       commited_rnn_state_dec = deepcopy(current_rnn_state_decs[to_write])
 
       -- Collapse beams to best beam
-      local committed_pointer = target_pointer + to_write
-      -- print("Committing to:", committed_pointer)
-      -- print(next_ys[{{1,committed_pointer},{}}])
+      -- For each layer, copy best beam onto every beam
       for l = 1,#commited_rnn_state_dec do
-        for k = 1,K do
+        for k = 1, K do
           commited_rnn_state_dec[l][{{k},{}}]:copy(commited_rnn_state_dec[l][{{best_beam},{}}])
-
-          prev_ks[{{committed_pointer}, {k}}]:copy(prev_ks[{{committed_pointer}, {best_beam}}])
-          next_ys[{{committed_pointer}, {k}}]:copy(next_ys[{{committed_pointer}, {best_beam}}])
-          scores[{{committed_pointer}, {k}}]:copy(scores[{{committed_pointer}, {best_beam}}])
-          -- print("Diff: ", State.same(states[committed_pointer][k], states[committed_pointer][best_beam]))
-          -- attn_argmax
-          for i = 1,#states[committed_pointer][best_beam] do
-            states[committed_pointer][k][i] = states[committed_pointer][best_beam][i]
-          end
-
-          for i = 1,#attn_argmax[committed_pointer][best_beam] do
-            attn_argmax[committed_pointer][k][i] = attn_argmax[committed_pointer][best_beam][i]
-          end
-
-          -- print("Copy success: ", State.same(states[committed_pointer][k], states[committed_pointer][best_beam]))
         end
       end
-      -- print("Best beam:",best_beam)
-      -- print(next_ys[{{1,committed_pointer},{}}])
-      
-      -- print(commited_rnn_state_dec[1][{{best_beam},{}}]:size())
-      -- print(commited_rnn_state_dec[1]:size())
-      
-      local decsum = 0
-      for idx = 1,#commited_rnn_state_dec do
-        decsum = decsum + commited_rnn_state_dec[idx]:sum()
+
+      -- For each beam, set the last prev_ks, next_ys and scores to the one of the
+      -- best beam
+      for k = 1, K do
+        prev_ks[{{committed_pointer}, {k}}]:copy(prev_ks[{{committed_pointer}, {best_beam}}])
+        next_ys[{{committed_pointer}, {k}}]:copy(next_ys[{{committed_pointer}, {best_beam}}])
+        scores[{{committed_pointer}, {k}}]:copy(scores[{{committed_pointer}, {best_beam}}])
+        
+        for i = 1,#states[committed_pointer][best_beam] do
+          states[committed_pointer][k][i] = states[committed_pointer][best_beam][i]
+        end
+
+        for i = 1,#attn_argmax[committed_pointer][best_beam] do
+          attn_argmax[committed_pointer][k][i] = attn_argmax[committed_pointer][best_beam][i]
+        end
       end
+      
       if (DEBUG) then
+        local decsum = 0
+        for idx = 1,#commited_rnn_state_dec do
+          decsum = decsum + commited_rnn_state_dec[idx]:sum()
+        end
         print("Committing dec state:", decsum)
         print("Committing dec index:", to_write)
       end
       
+      -- Set target pointer to correct location
       target_pointer = committed_pointer
     end
 
