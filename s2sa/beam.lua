@@ -490,6 +490,75 @@ function n_words_policy(source_phrase, states, attn, scores, prev_ks, next_ys, n
   end
 end
 
+local prev_ys
+
+function wait_if_diff_policy(source_phrase, states, attn, scores, prev_ks, next_ys, num_beams, num_committed)
+  policy_state = policy_state + 1
+  count = 0
+  if policy_state == 1 then
+    prev_ys = next_ys:clone()
+    return -1, 0
+  else
+    for k = num_committed+1, next_ys:size()[1] do
+      count = k
+      while ((next_ys[count][1] == prev_ys[count][1]) and count < next_ys:size()[1]) do
+        count = count + 1
+      end
+      prev_ys = next_ys:clone()
+      return -1, count - k
+    end
+  end
+  return -1,0
+end
+
+-- this function is an implementatin of Cho's wait if worse method
+local prev_ys
+local prev_scores
+function wait_if_worse_policy(source_phrase, states, attn, scores, prev_ks, next_ys, num_beams, num_committed, scores_all, i)
+  policy_state = policy_state + 1
+  count = 0
+  if policy_state == 1 then
+    prev_ys = next_ys:clone()
+    return -1, 0
+  else
+    for k = num_committed+1, prev_ys:size()[1] do
+      count = k
+      while (count < prev_ys:size()[1] and scores_all[count][2][prev_ys[count][1]] >= scores_all[count][1][prev_ys[count][1]]) do
+        count = count + 1
+      end
+      prev_ys = next_ys:clone()
+      return -1, count - k
+    end
+  end
+  return -1,0
+end
+
+-- this function is a modified form of wait if worse
+local prev_ys
+local prev_scores
+
+function wait_if_diff_worse_policy(source_phrase, states, attn, scores, prev_ks, next_ys, num_beams, num_committed)
+  policy_state = policy_state + 1
+  count = 0
+  if policy_state == 1 then
+    prev_ys = next_ys:clone()
+    prev_scores = scores:clone()
+    return -1, 0
+  else
+    for k = num_committed+1, next_ys:size()[1] do
+      -- TODO: This for is not needed. fixme.
+      count = k
+      while ((next_ys[count][1] == prev_ys[count][1]) and count < next_ys:size()[1] and scores[count][1] >= prev_scores[count][1]) do
+        count = count + 1
+      end
+      prev_ys = next_ys:clone()
+      prev_scores = scores:clone()
+      return -1, count - k
+    end
+  end
+  return -1,0
+end
+
 function n_words_constant_policy(source_phrase, states, attn, scores, prev_ks, next_ys, num_beams, num_committed)
   policy_state = policy_state + 1
 
@@ -682,9 +751,21 @@ function generate_beam_stream(model, initial, K, max_sent_l, source, source_feat
     policy_state = 0
     IS_START = 1
     start_words_so_far = 0
+  elseif opt.policy == 'wid' then
+    policy = wait_if_diff_policy
+    policy_state = 0
+  elseif opt.policy == 'widw' then
+    policy = wait_if_diff_worse_policy
+    policy_state = 0
+  elseif opt.policy == 'wiw' then
+    policy = wait_if_worse_policy
+    policy_state = 0
   else
     policy = full_source_policy
   end
+
+  -- keeping record of two timestamps for comparison
+  local scores_all = nil
 
   -- Reset decoder initial states
   if opt.gpuid >= 0 and opt.gpuid2 >= 0 then
@@ -889,6 +970,12 @@ function generate_beam_stream(model, initial, K, max_sent_l, source, source_feat
       local out = model[3]:forward(out_decoder[#out_decoder])
       -- out is scores per beam [K x vocab_size]
 
+      -- keep scores for all predicition
+      if scores_all == nil then
+        scores_all = torch.FloatTensor(n, 2, out:size(2)):fill(2)
+        -- set it 2 to be larger than maximum probability all the time
+        -- max_sent_length x two time stamps x vocab_size
+      end
       -- Get new RNN Decoder state
       rnn_state_dec = {} -- to be modified later
       if model_opt.input_feed == 1 then
@@ -912,13 +999,16 @@ function generate_beam_stream(model, initial, K, max_sent_l, source, source_feat
       -- All the scores are now available.
 
       local flat_out = out_float:view(-1)
-      
+
       -- If we have not predicted anything so far (only START OF SENT)
       -- all beams will have EXACTLY the same scores - so consider only
       -- the first beam (only when i=2)!
       if i == 2 then
         flat_out = out_float[1] -- all outputs same for first batch
       end
+
+      -- keep all the scores in a tensor
+      scores_all[i][2] = flat_out
 
       -- Only if you use special start symbol, we don't usually do
       -- this
@@ -1090,7 +1180,7 @@ function generate_beam_stream(model, initial, K, max_sent_l, source, source_feat
     else
       -- If we are here, it means we have NOT read all
       -- source words yet, so we should never commit EOS
-      best_beam_policy, to_write = policy(source[{{1,source_pointer}}], states, attn_argmax, scores, prev_ks, next_ys, K, target_pointer)
+      best_beam_policy, to_write = policy(source[{{1,source_pointer}}], states, attn_argmax, scores, prev_ks, next_ys, K, target_pointer, scores_all, i)
 
       -- policy will return best_beam and how many words it thinks we should
       -- write
@@ -1190,6 +1280,9 @@ function generate_beam_stream(model, initial, K, max_sent_l, source, source_feat
       -- Set target pointer to correct location
       target_pointer = committed_pointer
     end
+
+    -- keeping scores of previous time stamp
+    scores_all[{{},{1},{}}] = scores_all[{{},{2},{}}]
 
     -- Increment source pointer
     source_pointer = source_pointer + 1

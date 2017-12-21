@@ -15,8 +15,13 @@ All options remain the same as in the original implementation - we now have an a
 * `agent`: Use external agent to define when to read and write. Additional parameters are:
   * `agent_model`: Path to the trained agent model
   * `agent_vocab`: Path to trained agent model vocab
-  
+* `wid`: "Wait if Different" policy - essentially decode every source word and compare if with increasing source words, prediction of target words change or not [1].
+* `wiw`: "Wait if Worse" policy - compare with different source word context if probability of predicted words at time t-1 is worse than at time t [1].
+* `widw`: "Wait if Different and Worse" policy - combination of wid and wiw, if prediction at time t is different from prediction at time t-1 and the probability is not worse.
+
 Note that the stream decoder **requires** models trained with `init_dec=0`, since we cannot intialize the decoder with the last encoder state (We do not have the entire source sequence in stream decoding).
+
+[1] [Can neural machine translation do simultaneous translation?](https://arxiv.org/pdf/1606.02012.pdf)
 
 ## Sequence-to-Sequence Learning with Attentional Neural Networks
 
