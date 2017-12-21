@@ -510,6 +510,16 @@ function n_words_constant_policy(source_phrase, states, attn, scores, prev_ks, n
   local best_beam = -1
   local max_score = -1e9
 
+  local best_beam_eos = -1
+  local max_score_eos = -1e9
+
+  -- Initially, we ignore any beams with EOS, since
+  -- our agent is called only with partial source
+  -- sentences. If all beams have EOS, we then pick
+  -- the one with the best score
+  -- Note that the EOS will NOT be commited in the
+  -- main loop, since we explicitly know that the
+  -- source has not ended
   for k = 1,num_beams do
     local num_commit = opt.nwords_write
     local curr_hyp = nil
@@ -529,10 +539,22 @@ function n_words_constant_policy(source_phrase, states, attn, scores, prev_ks, n
     end
     assert(num_commit >= 0)
 
-    if scores[num_committed+num_commit][k] > max_score then
-      max_score = scores[num_committed+num_commit][k]
-      best_beam = k
+    if curr_hyp[#curr_hyp] == END then
+      if scores[num_committed+num_commit][k] > max_score_eos then
+        max_score_eos = scores[num_committed+num_commit][k]
+        best_beam_eos = k
+      end
+    else
+      if scores[num_committed+num_commit][k] > max_score then
+        max_score = scores[num_committed+num_commit][k]
+        best_beam = k
+      end
     end
+  end
+
+  if best_beam == -1 then
+    best_beam = best_beam_eos
+    max_score = max_score_eos
   end
 
   -- Here we can return num_commit (which is a better estimation
