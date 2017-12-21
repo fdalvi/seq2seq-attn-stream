@@ -754,12 +754,15 @@ function generate_beam_stream(model, initial, K, max_sent_l, source, source_feat
   elseif opt.policy == 'wid' then
     policy = wait_if_diff_policy
     policy_state = 0
+    assert(K==1) -- policy only works for greedy decoding
   elseif opt.policy == 'widw' then
     policy = wait_if_diff_worse_policy
     policy_state = 0
+    assert(K==1) -- policy only works for greedy decoding
   elseif opt.policy == 'wiw' then
     policy = wait_if_worse_policy
     policy_state = 0
+    assert(K==1) -- policy only works for greedy decoding
   else
     policy = full_source_policy
   end
