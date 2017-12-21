@@ -1,3 +1,23 @@
+## Sequence-to-Sequence Learning with Attention and Simultaneous Decoding
+All options remain the same as in the original implementation - we now have an additional options that enable stream decoding:
+* `stream`: Set to 1 to enable simultaneous decoding, 0 to perform normal decoding
+* `policy`: The policy to use for defining the strategy of stream decoding. Currently available policies are defined below.
+
+#### Policies
+* `wue`: "Wait until End" policy - essentially read the entire sentence and then translate. This matches `stream=0` and is included as a sanity check.
+* `nwords`: Policy that reads `R` words and writes `W` words repeatedly. The pattern is `R-W-R-W...`. Additional parameters are:
+  * `nwords_read`: Number of words to read `R`
+  * `nwords_write`: Number of words to write `W`
+* `nwordsconstant`: Policy to read `S` words in the beginning, write `W` and read `R`. The pattern is `S-W-R-W-R...`. Additional parameters are:
+  * `nwords_start`: Number of words to start with `S`
+  * `nwords_read`: Number of words to read `R`
+  * `nwords_write`: Number of words to write `W`
+* `agent`: Use external agent to define when to read and write. Additional parameters are:
+  * `agent_model`: Path to the trained agent model
+  * `agent_vocab`: Path to trained agent model vocab
+  
+Note that the stream decoder **requires** models trained with `init_dec=0`, since we cannot intialize the decoder with the last encoder state (We do not have the entire source sequence in stream decoding).
+
 ## Sequence-to-Sequence Learning with Attentional Neural Networks
 
 [Torch](http://torch.ch) implementation of a standard sequence-to-sequence model with (optional)
