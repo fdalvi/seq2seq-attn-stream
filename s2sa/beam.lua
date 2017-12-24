@@ -514,7 +514,7 @@ end
 -- this function is an implementatin of Cho's wait if worse method
 local prev_ys
 local prev_scores
-function wait_if_worse_policy(source_phrase, states, attn, scores, prev_ks, next_ys, num_beams, num_committed, scores_all, i)
+function wait_if_worse_policy(source_phrase, states, attn, scores, prev_ks, next_ys, num_beams, num_committed, scores_history, i)
   policy_state = policy_state + 1
   count = 0
   if policy_state == 1 then
@@ -523,7 +523,7 @@ function wait_if_worse_policy(source_phrase, states, attn, scores, prev_ks, next
   else
     for k = num_committed+1, prev_ys:size()[1] do
       count = k
-      while (count < prev_ys:size()[1] and scores_all[count][2][prev_ys[count][1]] >= scores_all[count][1][prev_ys[count][1]]) do
+      while (count < prev_ys:size()[1] and scores_history[count][2][prev_ys[count][1]] >= scores_history[count][1][prev_ys[count][1]]) do
         count = count + 1
       end
       prev_ys = next_ys:clone()
@@ -767,8 +767,13 @@ function generate_beam_stream(model, initial, K, max_sent_l, source, source_feat
     policy = full_source_policy
   end
 
-  -- keeping record of two timestamps for comparison
-  local scores_all = nil
+  -- keeping record of all the scores for two decoder runs
+  -- This is useful for some policies that want to compare
+  --   scores between two decoder runs such as wid, wiw etc.
+  -- scores_history[..][2] always stores scores for the latest
+  --   run, and scores_history[..][1] are the scores for
+  --   the previous decoder run
+  local scores_history = nil
 
   -- Reset decoder initial states
   if opt.gpuid >= 0 and opt.gpuid2 >= 0 then
@@ -973,12 +978,6 @@ function generate_beam_stream(model, initial, K, max_sent_l, source, source_feat
       local out = model[3]:forward(out_decoder[#out_decoder])
       -- out is scores per beam [K x vocab_size]
 
-      -- keep scores for all predicition
-      if scores_all == nil then
-        scores_all = torch.FloatTensor(n, 2, out:size(2)):fill(2)
-        -- set it 2 to be larger than maximum probability all the time
-        -- max_sent_length x two time stamps x vocab_size
-      end
       -- Get new RNN Decoder state
       rnn_state_dec = {} -- to be modified later
       if model_opt.input_feed == 1 then
@@ -991,6 +990,7 @@ function generate_beam_stream(model, initial, K, max_sent_l, source, source_feat
       -- Convert scores to float tensor explicitly
       out_float:resize(out:size()):copy(out)
       -- out_float is also of size K x vocab_size
+
       for k = 1, K do
         -- Explicitly not allow "PAD" and "START_OF_SENT" to be 
         -- max scores
@@ -1003,15 +1003,20 @@ function generate_beam_stream(model, initial, K, max_sent_l, source, source_feat
 
       local flat_out = out_float:view(-1)
 
+      -- Initialize scores_history if it has not been intialized yet
+      if scores_history == nil then
+        scores_history = torch.FloatTensor(n, 2, flat_out:size(1)):fill(2)
+        -- set it 2 to be larger than maximum probability all the time
+        -- max_sent_length x two time stamps x vocab_size
+      end
+      scores_history[i][2] = flat_out
+
       -- If we have not predicted anything so far (only START OF SENT)
       -- all beams will have EXACTLY the same scores - so consider only
       -- the first beam (only when i=2)!
       if i == 2 then
         flat_out = out_float[1] -- all outputs same for first batch
       end
-
-      -- keep all the scores in a tensor
-      scores_all[i][2] = flat_out
 
       -- Only if you use special start symbol, we don't usually do
       -- this
@@ -1159,6 +1164,9 @@ function generate_beam_stream(model, initial, K, max_sent_l, source, source_feat
     -- max_{*} = end_{*}
     if opt.simple == 1 or end_score > max_score or not found_eos then
       best_beam = 1
+      -- TODO: Sometimes, max_hyp is BOS word word word EOS word
+      --   in this case, the following check will fail. Investigate
+      --   further.
       max_hyp = end_hyp
       max_score = end_score
       max_attn_argmax = end_attn_argmax
@@ -1183,7 +1191,7 @@ function generate_beam_stream(model, initial, K, max_sent_l, source, source_feat
     else
       -- If we are here, it means we have NOT read all
       -- source words yet, so we should never commit EOS
-      best_beam_policy, to_write = policy(source[{{1,source_pointer}}], states, attn_argmax, scores, prev_ks, next_ys, K, target_pointer, scores_all, i)
+      best_beam_policy, to_write = policy(source[{{1,source_pointer}}], states, attn_argmax, scores, prev_ks, next_ys, K, target_pointer, scores_history, i)
 
       -- policy will return best_beam and how many words it thinks we should
       -- write
@@ -1215,6 +1223,9 @@ function generate_beam_stream(model, initial, K, max_sent_l, source, source_feat
       -- This will happen when the policy is dumb, i.e. it doesn't
       -- check if to_write number of writes is even possible
       if to_write >= num_new_words then
+        -- TODO: Sometimes, max_hyp is BOS word word word EOS word
+        --   in this case, the following check will fail. Investigate
+        --   further.
         if max_hyp[#max_hyp] == END then
           to_write = num_new_words - 1
         else
@@ -1284,8 +1295,8 @@ function generate_beam_stream(model, initial, K, max_sent_l, source, source_feat
       target_pointer = committed_pointer
     end
 
-    -- keeping scores of previous time stamp
-    scores_all[{{},{1},{}}] = scores_all[{{},{2},{}}]
+    -- keeping scores of previous decoder run
+    scores_history[{{},{1},{}}] = scores_history[{{},{2},{}}]
 
     -- Increment source pointer
     source_pointer = source_pointer + 1
