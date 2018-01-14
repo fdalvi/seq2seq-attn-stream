@@ -2,6 +2,7 @@
 All options remain the same as in the original implementation - we now have an additional options that enable stream decoding:
 * `stream`: Set to 1 to enable simultaneous decoding, 0 to perform normal decoding
 * `policy`: The policy to use for defining the strategy of stream decoding. Currently available policies are defined below.
+* `delay_file`: Set to a filename to output the number of source words each target word waits for before being committed - Hence this file will have one number of each output token, and the same number of total lines as the actual target file.
 
 #### Policies
 * `wue`: "Wait until End" policy - essentially read the entire sentence and then translate. This matches `stream=0` and is included as a sanity check.
