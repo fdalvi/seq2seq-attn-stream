@@ -8,9 +8,16 @@ function main()
 
   local file = io.open(opt.src_file, "r")
   local out_file = io.open(opt.output_file,'w')
+  local delay_file = nil
+  if opt.delay_file ~= '' then
+    delay_file = io.open(opt.delay_file, 'w')
+  end
   for line in file:lines() do
-    result, nbests = beam.search(line)
+    result, nbests, result_delay = beam.search(line)
     out_file:write(result .. '\n')
+    if opt.delay_file ~= '' then
+      delay_file:write(result_delay .. '\n')
+    end
 
     for n = 1, #nbests do
       out_file:write(nbests[n] .. '\n')
@@ -25,6 +32,9 @@ function main()
       math.exp(-gold_score_total/gold_words_total)))
   end
   out_file:close()
+  if opt.delay_file ~= '' then
+    delay_file:close()
+  end
 end
 
 main()

@@ -59,6 +59,9 @@ cmd:option('-nwords_write', 4, [[nwords policy write delay]])
 cmd:option('-agent_model', '', [[trained agent]])
 cmd:option('-agent_vocab', '', [[path to agent_vocab]])
 
+-- extra information
+cmd:option('-delay_file', '', [[If != '', every output word has an associated token as to how many source words were waiting on saved in delay_file]])
+
 function copy(orig)
   local orig_type = type(orig)
   local copy
@@ -527,7 +530,7 @@ function wait_if_worse_policy(source_phrase, states, attn, scores, prev_ks, next
         count = count + 1
       end
       prev_ys = next_ys:clone()
-      return -1, count - k
+      return 1, count - k
     end
   end
   return -1,0
@@ -762,7 +765,6 @@ function generate_beam_stream(model, initial, K, max_sent_l, source, source_feat
   elseif opt.policy == 'wiw' then
     policy = wait_if_worse_policy
     policy_state = 0
-    assert(K==1) -- policy only works for greedy decoding
   else
     policy = full_source_policy
   end
@@ -864,6 +866,12 @@ function generate_beam_stream(model, initial, K, max_sent_l, source, source_feat
   local stream_hyp = {}
   table.insert(stream_hyp, START)
   -- target_pointer is 1 since we have already committed START_OF_SENT
+
+  -- Delay for current hypothesis
+  local delay_hyp = {}
+  -- This will be of the form {6, 6, 6, 7, 7} etc
+  -- (How many source words did the ith target word wait for)
+  -- Useful to compute AP
 
   -- TODO: Handle reading end of source
   while true and not fully_done do
@@ -1005,11 +1013,11 @@ function generate_beam_stream(model, initial, K, max_sent_l, source, source_feat
 
       -- Initialize scores_history if it has not been intialized yet
       if scores_history == nil then
-        scores_history = torch.FloatTensor(n, 2, flat_out:size(1)):fill(2)
+        scores_history = torch.FloatTensor(n, 2, out_float:size(2)):fill(2)
         -- set it 2 to be larger than maximum probability all the time
         -- max_sent_length x two time stamps x vocab_size
       end
-      scores_history[i][2] = flat_out
+      scores_history[i][2] = out_float[1]
 
       -- If we have not predicted anything so far (only START OF SENT)
       -- all beams will have EXACTLY the same scores - so consider only
@@ -1252,6 +1260,9 @@ function generate_beam_stream(model, initial, K, max_sent_l, source, source_feat
       for target_idx = target_pointer+1, committed_pointer do
         table.insert(stream_hyp, max_hyp[target_idx])
         if (DEBUG) then print("WRITE",idx2word_targ[max_hyp[target_idx]]) end
+        if opt.delay_file ~= '' then
+          table.insert(delay_hyp, source_pointer)
+        end
       end
 
       -- Consider the to_write'th time step for the next "committed" RNN
@@ -1302,7 +1313,7 @@ function generate_beam_stream(model, initial, K, max_sent_l, source, source_feat
     source_pointer = source_pointer + 1
   end
   if (DEBUG) then print(stream_hyp) end
-  return stream_hyp, max_score, max_attn_argmax, gold_score, best_hyp, best_scores, best_attn_argmax
+  return stream_hyp, max_score, max_attn_argmax, gold_score, best_hyp, best_scores, best_attn_argmax, delay_hyp
 end
 
 function idx2key(file)
@@ -1687,7 +1698,7 @@ function search(line)
   end
   state = State.initial(START)
   if opt.stream == 1 then
-    pred, pred_score, attn, gold_score, all_sents, all_scores, all_attn = generate_beam_stream(model,
+    pred, pred_score, attn, gold_score, all_sents, all_scores, all_attn, pred_delay = generate_beam_stream(model,
       state, opt.beam, MAX_SENT_L, source, source_features, target)
   else
     pred, pred_score, attn, gold_score, all_sents, all_scores, all_attn = generate_beam(model,
@@ -1720,7 +1731,13 @@ function search(line)
 
   print('')
 
-  return pred_sent, nbests
+  if opt.delay_file ~= '' then
+    -- Remove EOS token delay
+    table.remove(pred_delay, #pred_delay)
+    return pred_sent, nbests, table.concat(pred_delay, ' ')
+  else
+    return pred_sent, nbests
+  end
 end
 
 function getOptions()
