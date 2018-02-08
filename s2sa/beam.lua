@@ -298,13 +298,17 @@ function generate_beam(model, initial, K, max_sent_l, source, source_features, g
     end
 
     local out_decoder = model[2]:forward(decoder_input)
-    local out = model[3]:forward(out_decoder[#out_decoder]) -- K x vocab_size
+    local out_pred_idx = #out_decoder
+    if model_opt.guided_alignment == 1 then
+        out_pred_idx = #out_decoder - 1
+    end
+    local out = model[3]:forward(out_decoder[out_pred_idx]) -- K x vocab_size
 
     rnn_state_dec = {} -- to be modified later
     if model_opt.input_feed == 1 then
-      table.insert(rnn_state_dec, out_decoder[#out_decoder])
+      table.insert(rnn_state_dec, out_decoder[out_pred_idx])
     end
-    for j = 1, #out_decoder - 1 do
+    for j = 1, out_pred_idx - 1 do
       table.insert(rnn_state_dec, out_decoder[j])
     end
     out_float:resize(out:size()):copy(out)
@@ -982,16 +986,21 @@ function generate_beam_stream(model, initial, K, max_sent_l, source, source_feat
       -- Forward pass on the attention mechanism and decoder
       local out_decoder = model[2]:forward(decoder_input)
 
+      local out_pred_idx = #out_decoder
+      if model_opt.guided_alignment == 1 then
+          out_pred_idx = #out_decoder - 1
+      end
+
       -- model[3] is the generator model
-      local out = model[3]:forward(out_decoder[#out_decoder])
+      local out = model[3]:forward(out_decoder[out_pred_idx])
       -- out is scores per beam [K x vocab_size]
 
       -- Get new RNN Decoder state
       rnn_state_dec = {} -- to be modified later
       if model_opt.input_feed == 1 then
-        table.insert(rnn_state_dec, out_decoder[#out_decoder])
+        table.insert(rnn_state_dec, out_decoder[out_pred_idx])
       end
-      for j = 1, #out_decoder - 1 do
+      for j = 1, out_pred_idx - 1 do
         table.insert(rnn_state_dec, out_decoder[j])
       end
 
